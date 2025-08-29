@@ -197,7 +197,7 @@ export default function GoogleReviewsApp() {
             <div className="space-y-2">
               <h3 className="font-semibold text-blue-900 dark:text-blue-100">🔑 API Setup Required</h3>
               <p className="text-sm text-blue-800 dark:text-blue-200">
-                This app uses the official Google Places API. You'll need to:
+                This app uses the official Google Places API. You&apos;ll need to:
               </p>
               <ul className="text-sm text-blue-800 dark:text-blue-200 list-disc list-inside space-y-1">
                 <li>Get a Google Places API key from Google Cloud Console</li>
