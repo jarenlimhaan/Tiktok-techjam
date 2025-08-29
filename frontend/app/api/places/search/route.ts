@@ -61,7 +61,14 @@ export async function POST(request: NextRequest) {
       rating: detailsData.rating || 0,
       user_ratings_total: detailsData.userRatingCount || 0,
       reviews:
-        detailsData.reviews?.map((review: any) => ({
+        detailsData.reviews?.map((review: {
+          authorAttribution?: { displayName?: string; uri?: string; photoUri?: string };
+          originalText?: { languageCode?: string; text?: string };
+          text?: { text?: string };
+          rating?: number;
+          relativePublishTimeDescription?: string;
+          publishTime?: string;
+        }) => ({
           author_name: review.authorAttribution?.displayName || "Anonymous",
           author_url: review.authorAttribution?.uri || "",
           language: review.originalText?.languageCode || "en",
@@ -69,7 +76,7 @@ export async function POST(request: NextRequest) {
           rating: review.rating || 0,
           relative_time_description: review.relativePublishTimeDescription || "Recently",
           text: review.originalText?.text || review.text?.text || "",
-          time: new Date(review.publishTime).getTime() / 1000,
+          time: review.publishTime ? new Date(review.publishTime).getTime() / 1000 : Date.now() / 1000,
         })) || [],
     }
 
