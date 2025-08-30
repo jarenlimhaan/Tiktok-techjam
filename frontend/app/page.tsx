@@ -44,6 +44,7 @@ interface GeocodingResult {
 export default function GoogleReviewsApp() {
   const [searchQuery, setSearchQuery] = useState("")
   const [placeDetails, setPlaceDetails] = useState<PlaceDetails | null>(null)
+  const [reviewAnalysis, setReviewAnalysis] = useState<string>("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const [searchResults, setSearchResults] = useState<GeocodingResult[]>([])
@@ -97,6 +98,7 @@ export default function GoogleReviewsApp() {
       const data = await response.json()
       setSearchResults(data.results || [])
       setShowDropdown(data.results && data.results.length > 0)
+      sendReviewTexts()
       setSelectedIndex(-1)
     } catch (err) {
       console.error("Search error:", err)
@@ -123,6 +125,7 @@ export default function GoogleReviewsApp() {
     setLoading(true)
     setError("")
     setPlaceDetails(null)
+    setReviewAnalysis("")
 
     try {
       const response = await fetch("/api/places/search", {
@@ -139,6 +142,7 @@ export default function GoogleReviewsApp() {
 
       const data = await response.json()
       setPlaceDetails(data)
+      sendReviewTexts()
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred")
     } finally {
@@ -152,7 +156,7 @@ export default function GoogleReviewsApp() {
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault()
-        setSelectedIndex(prev => 
+        setSelectedIndex(prev =>
           prev < searchResults.length - 1 ? prev + 1 : prev
         )
         break
@@ -191,6 +195,34 @@ export default function GoogleReviewsApp() {
       />
     ))
   }
+
+  const sendReviewTexts = async () => {
+    if (!placeDetails || !placeDetails.reviews) return;
+
+    // Extract all review texts
+    const reviewTexts = placeDetails.reviews.map(r => r.text);
+
+    try {
+      const response = await fetch("http://localhost:8000/inference", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ reviews: reviewTexts }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to send reviews");
+      }
+
+      // Optionally handle response
+      const data = await response.json();
+      setReviewAnalysis(data);
+      console.log("Server response:", data);
+    } catch (err) {
+      console.error("Error sending reviews:", err);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-background p-4">
@@ -292,6 +324,7 @@ export default function GoogleReviewsApp() {
                     <span className="font-semibold">{placeDetails.rating}</span>
                   </div>
                   <Badge variant="secondary">{placeDetails.user_ratings_total} reviews</Badge>
+                   <Badge variant="secondary">{reviewAnalysis}</Badge>
                 </div>
               </CardContent>
             </Card>

@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
     const mapboxUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json`
     const params = new URLSearchParams({
       access_token: apiKey,
-      limit: "5", // Limit to 5 results for dropdown
+      limit: "10", // Limit to 10 results for dropdown
       types: "poi,address,place", // Points of interest, addresses, and places
     })
 
