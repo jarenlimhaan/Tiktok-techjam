@@ -8,36 +8,16 @@ A lightweight content-moderation pipeline that cleans Google-style location revi
 * 🤖 **Fine-tuning DistilBERT** with class-balancing and weighted loss
 * 🚀 **One-file inference** to run predictions on new text
 
-
----
-
-## 🗂 Repo Structure
-
-```
-.
-├── data_cleaning.py     # Clean, rule-label, pseudo-label, stratified split → CSVs + label maps
-├── train_hf.py          # Hugging Face fine-tuning (DistilBERT), weighted Trainer, reports
-├── main.py              # Load best checkpoint and run predictions on raw text
-└── data/
-    └── processed/
-        ├── train.csv   # created by data_cleaning.py
-        ├── val.csv
-        ├── test.csv
-        ├── label2id.json
-        └── id2label.json
-```
-
-> Expected raw inputs (same directory as scripts): **`reviews.csv`** and optional **`reviews2.csv`** with columns:
-> `business_name, author_name, text, photo, rating, rating_category`
-
+![Image](image.png)
 ---
 
 ## ⚙️ Tech Stack
-
-* Python, Pandas, scikit-learn
+* Next JS & Typescript
+* Python, FastAPI, Pandas, scikit-learn
 * PyTorch, Hugging Face Transformers/Datasets
 * DistilBERT sequence classification
 * Optional Zero-Shot (`facebook/bart-large-mnli` by default)
+
 
 ---
 

@@ -381,24 +381,6 @@ export default function GoogleReviewsApp() {
           </div>
         )}
 
-        {/* API Notice */}
-        <Card className="border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950">
-          <CardContent className="pt-6">
-            <div className="space-y-2">
-              <h3 className="font-semibold text-blue-900 dark:text-blue-100">🔑 API Setup Required</h3>
-              <p className="text-sm text-blue-800 dark:text-blue-200">
-                This app uses the Mapbox Geocoding API for location search and Google Places API for reviews. You&apos;ll need to:
-              </p>
-              <ul className="text-sm text-blue-800 dark:text-blue-200 list-disc list-inside space-y-1">
-                <li>Get a Mapbox access token from Mapbox account dashboard</li>
-                <li>Get a Google Places API key from Google Cloud Console</li>
-                <li>Enable the Places API (New) service in Google Cloud</li>
-                <li>Add your Mapbox token to environment variables as MAPBOX_ACCESS_TOKEN</li>
-                <li>Add your Google API key to environment variables as GOOGLE_PLACES_API_KEY</li>
-              </ul>
-            </div>
-          </CardContent>
-        </Card>
       </div>
     </div>
   )
