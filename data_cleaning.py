@@ -33,7 +33,7 @@ CONFIG = {
     "drop_dupes": True,
 
     # Label space (binary for now)
-    "labels": ["Ad", "Good"],
+    "labels": ["Ad", "Good","Rant","Spam"],
 
     # Rule labeling sensitivity
     "ad_rules": {
@@ -90,6 +90,10 @@ DISCOUNT_RE = re.compile(r"(\b\d{1,3}%\s?off\b|\bpromo(?:tion)?\b|\bcoupon\b|\bu
 CTA_RE = re.compile(r"(call\s+now|order\s+today|buy\s+now|dm\s+(us|me)|pm\s+us|click\s+here|subscribe|book\s+now|contact\s+(me|us))", re.I)
 KEYWORDS_RE = re.compile(r"(free\s+delivery|free\s+install|cheap\s+price|best\s+price|limited\s*time|fast\s+deal|whatsapp)", re.I)
 EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")  # broad emoji ranges
+RANT_RE = re.compile(r"(never going back|worst service|waste of money|terrible|awful|horrible|disgusting|rude staff|long wait|dirty|scam)", re.I)
+SPAM_RE = re.compile(r"(asdfgh|zzzz|!!!!!+|😂😂😂😂|http[s]?:\/\/[^\s]*\shttp[s]?:\/\/)", re.I)
+
+
 
 
 def basic_clean(s: str) -> str:
@@ -131,29 +135,32 @@ def rule_features(text: str, cfg: Dict) -> Dict[str, int]:
 
 
 def rule_label(text: str) -> Tuple[str, str]:
-    """
-    Return (label, label_source)
-    label_source: 'rule_strong', 'rule_weak', or '' (empty means undecided).
-    """
     feats = rule_features(text, CONFIG["ad_rules"])
     hits = sum(1 for v in feats.values() if v > 0)
 
-    # Strong Ad patterns
+    # Ad detection (same as before)
     strong_ad = (feats["url"] or feats["contact"] or feats["discount"] or feats["cta"])
     if strong_ad and hits >= 2:
         return "Ad", "rule_strong"
-
-    # Lenient mode: softer combos count as Ad
     if CONFIG["ad_rules"]["lenient"]:
         if (feats["keyword"] and (feats["repeat"] or feats["caps"])) or (hits >= 2 and (feats["keyword"] or feats["currency"])):
             return "Ad", "rule_weak"
 
-    # Strong Good: no signals at all
+    # Rant detection
+    if RANT_RE.search(text):
+        return "Rant", "rule_strong"
+
+    # Spam detection
+    if SPAM_RE.search(text):
+        return "Spam", "rule_strong"
+
+    # Good (no signals)
     if hits == 0:
         return "Good", "rule_strong"
 
     # Otherwise undecided
     return "", ""
+
 
 
 # ----------------- PSEUDO-LABELER -----------------
@@ -212,7 +219,7 @@ def pseudo_label_with_zsl(texts: List[str]) -> Tuple[List[str], List[float], Lis
                    model=CONFIG["zsl_model"],
                    device=-1,             # CPU is safest across environments
                    truncation=True)
-    labels = CONFIG["labels"]  # ["Ad","Good"]
+    labels = CONFIG["labels"]  # ["Ad", "Good", "Rant", "Spam"]
     preds, tops, margins = [], [], []
     bs = CONFIG["zsl_batch_size"]
     for i in range(0, len(texts), bs):
@@ -298,39 +305,19 @@ def apply_pseudo_labeling(df: pd.DataFrame) -> pd.DataFrame:
 # -------------- Rebalance helper --------------
 
 def rebalance_train(df_train: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make Ad:Good ~ 1:1 using oversample-with-replacement on minority.
-    """
     counts = df_train["label"].value_counts()
-    if set(counts.index) != set(CONFIG["labels"]):
-        return df_train
-    n_ad = int(counts.get("Ad", 0))
-    n_good = int(counts.get("Good", 0))
-    if n_ad == 0 or n_good == 0:
-        return df_train
-
-    target = max(n_ad, n_good)  # 1:1 target at the larger class
+    target = counts.max()  # bring all classes up to majority
     rng = random.Random(CONFIG["random_seed"])
-
-    def oversample(cls, need):
-        part = df_train[df_train["label"] == cls]
-        if need <= 0:
-            return part
-        extra = part.sample(n=need, replace=True, random_state=CONFIG["random_seed"])
-        return pd.concat([part, extra], ignore_index=True)
-
-    if n_ad < target:
-        ad_part = oversample("Ad", target - n_ad)
-        good_part = df_train[df_train["label"] == "Good"]
-    else:
-        good_part = oversample("Good", target - n_good)
-        ad_part = df_train[df_train["label"] == "Ad"]
-
-    out = pd.concat([ad_part, good_part], ignore_index=True).sample(frac=1.0, random_state=CONFIG["random_seed"])
-    if CONFIG["max_train_per_class"]:
-        out = (out.groupby("label", group_keys=False)
-                 .head(CONFIG["max_train_per_class"]))
+    parts = []
+    for lbl in CONFIG["labels"]:
+        part = df_train[df_train["label"] == lbl]
+        if len(part) == 0:
+            continue
+        extra = part.sample(n=target - len(part), replace=True, random_state=CONFIG["random_seed"])
+        parts.append(pd.concat([part, extra], ignore_index=True))
+    out = pd.concat(parts, ignore_index=True).sample(frac=1.0, random_state=CONFIG["random_seed"])
     return out
+
 
 
 # -------------- Main pipeline --------------
@@ -339,9 +326,20 @@ def main():
     random.seed(CONFIG["random_seed"])
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
-    # 1) Load CSV
-    df = pd.read_csv(CONFIG["input_csv"])
+    # 1) Load CSVs
+    df1 = pd.read_csv("reviews.csv")
+    df2 = pd.read_csv("reviews2.csv")
+
+    # Make sure df2 has the same columns as df1
     need = ["business_name", "author_name", "text", "photo", "rating", "rating_category"]
+    for c in need:
+        if c not in df2.columns:
+            df2[c] = ""   # add missing columns if any
+
+    # Concatenate
+    df = pd.concat([df1, df2], ignore_index=True)
+
+    # Sanity check
     miss = [c for c in need if c not in df.columns]
     if miss:
         raise ValueError(f"Missing expected columns: {miss}")
@@ -354,6 +352,9 @@ def main():
 
     # 3) Rules + Pseudo labeling
     df_labeled = apply_pseudo_labeling(df)
+
+
+
 
     # 4) Map labels to ids
     label2id = {lbl: i for i, lbl in enumerate(CONFIG["labels"])}
