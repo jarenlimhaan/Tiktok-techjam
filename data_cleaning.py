@@ -1,170 +1,82 @@
 #!/usr/bin/env python3
 # data_cleaning_pseudolabel.py
-# One-click cleaner + pseudo-labeler for "Ad" vs "Good" Google reviews.
-# Input : reviews.csv with columns:
+# One-click cleaner + pseudo-labeler for Google reviews.
+# Input : reviews.csv (+ reviews2.csv) with columns:
 #         business_name, author_name, text, photo, rating, rating_category
-# Output: data/processed/train.csv, val.csv, test.csv with columns: text,label,label_id,label_source
+# Output: data/processed/train.csv, val.csv, test.csv
 #         data/processed/label2id.json, id2label.json
 
 import os, re, json, random
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-# Hugging Face imports (pseudo-labeler)
+# Hugging Face imports
 import torch
-from transformers import (
-    AutoTokenizer, AutoModelForSequenceClassification, pipeline
-)
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
 # ============== CONFIG ==============
 CONFIG = {
-    # Files
-    "input_csv": "reviews.csv",
     "output_dir": "data/processed",
     "random_seed": 42,
-
-    # Splits
     "val_size": 0.11,
-    "test_size": 0.11,   # ~78/11/11 overall
-
-    # Cleaning
+    "test_size": 0.11,
     "min_chars": 20,
     "drop_dupes": True,
+    "labels": ["Ad", "Good", "Rant", "Spam"],
 
-    # Label space (binary for now)
-    "labels": ["Ad", "Good","Rant","Spam"],
-
-    # Rule labeling sensitivity
-    "ad_rules": {
-        "lenient": True,   # allow softer combinations to count as Ad
-
-        "check_urls": True,
-        "check_contacts": True,
-        "check_prices": True,
-        "check_discounts": True,
-        "check_cta": True,
-        "check_keywords": True,
-        "check_repetition": True,
-        "check_caps_ratio": True,
-        "check_emoji_row": True,
-
-        "min_caps_ratio": 0.25,
-        "min_repeated_word": 3,
-        "min_emojis": 3,
-    },
-
-    # Pseudo-labeling
-    # If a local fine-tuned checkpoint exists, we use it; else fall back to zero-shot.
-    "teacher_model_dir": "checkpoints/distilbert_policy",  # your fine-tuned model (optional)
+    "teacher_model_dir": "checkpoints/distilbert_policy",
     "teacher_max_length": 128,
-
-    # Thresholds to accept a pseudo-label (avoid noisy labels)
-    "pseudo_threshold_overall": 0.90,   # top prob must be >= this
-    "pseudo_threshold_ad": 0.60,        # if predicted "Ad", allow a lower bar to grow minority
-    "min_margin": 0.20,                 # top_prob - second_prob must be >= this
-
-    # Put pseudo-labeled rows ONLY into train (safer for evaluation)
+    "pseudo_threshold_overall": 0.95,
+    "pseudo_threshold_ad": 0.60,
+    "min_margin": 0.15,
     "pseudo_label_train_only": True,
-
-    # Rebalance training to ~1:1 after labeling (oversample minority with replacement)
     "rebalance_train": True,
-    "max_train_per_class": None,        # cap per class if you want (None = no cap)
-
-    # Zero-shot model used if teacher not found (CPU fallback is fine)
     "zsl_model": "facebook/bart-large-mnli",
     "zsl_batch_size": 8,
 }
-# ====================================
 
+# ============== REGEX (only obvious patterns) ==============
+URL_RE   = re.compile(r'(https?://\S+|www\.\S+)', re.I)
+EMAIL_RE = re.compile(r'\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b', re.I)
+PHONE_RE = re.compile(r'\b\d{8,}\b')
+SOCIAL_RE= re.compile(r'(instagram\.com|facebook\.com|t\.me|wa\.me|wechat|line id|ig\s*@\w+)', re.I)
 
-# -------- regex library for rule Ad detection --------
-URL_RE = re.compile(
-    r"((https?://|www\.)\S+|[\w-]+\.(com|co|net|sg|io|me|info|biz|shop|store)\b)", re.I
-)
-PHONE_RE = re.compile(r"(\+?\d[\d\s\-]{7,}\d|\b\d{8}\b)", re.I)
-EMAIL_RE = re.compile(r"\b[\w.\-+]+@[\w.\-]+\.[A-Za-z]{2,}\b", re.I)
-SOCIAL_RE = re.compile(r"(instagram\.com/\w+|facebook\.com/\w+|t\.me/\w+|wa\.me/\w+|wechat|line id|tg\s*@\w+|ig\s*@\w+)", re.I)
-CURRENCY_RE = re.compile(r"(\$+\s?\d+(?:[\.,]\d{2})?|\bsgd\b|s\$\s?\d+|rm\s?\d+|nt\$\s?\d+|usd\s?\d+)", re.I)
-DISCOUNT_RE = re.compile(r"(\b\d{1,3}%\s?off\b|\bpromo(?:tion)?\b|\bcoupon\b|\buse\s+code\b|\bdeal\b|\bsale\b)", re.I)
-CTA_RE = re.compile(r"(call\s+now|order\s+today|buy\s+now|dm\s+(us|me)|pm\s+us|click\s+here|subscribe|book\s+now|contact\s+(me|us))", re.I)
-KEYWORDS_RE = re.compile(r"(free\s+delivery|free\s+install|cheap\s+price|best\s+price|limited\s*time|fast\s+deal|whatsapp)", re.I)
-EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")  # broad emoji ranges
-RANT_RE = re.compile(r"(never going back|worst service|waste of money|terrible|awful|horrible|disgusting|rude staff|long wait|dirty|scam)", re.I)
-SPAM_RE = re.compile(r"(asdfgh|zzzz|!!!!!+|😂😂😂😂|http[s]?:\/\/[^\s]*\shttp[s]?:\/\/)", re.I)
+MULTI_URL_RE = re.compile(r'(https?://\S+.*?https?://\S+)', re.I)
+KEYBOARD_MASH_RE = re.compile(r'\b(asdfgh|qwerty|zzzz+|xxxx+|!!!!+)\b', re.I)
 
+RANT_RE = re.compile(r'(never going back|worst service|waste of money|terrible|awful|horrible|disgusting|rude staff|long wait|dirty|scam)', re.I)
 
-
-
+# ============== HELPERS ==============
 def basic_clean(s: str) -> str:
     if not isinstance(s, str):
         return ""
     s = s.replace("\r", " ").replace("\n", " ")
     s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
-
-def upper_ratio(tokens: List[str]) -> float:
-    uppers = sum(1 for t in tokens if len(t) >= 2 and t.isupper())
-    return 0.0 if not tokens else uppers / len(tokens)
-
-
-def repeated_token_count(s: str) -> int:
-    toks = re.findall(r"[A-Za-z0-9]+", s.lower())
-    if not toks:
-        return 0
-    from collections import Counter
-    c = Counter(toks)
-    return max(c.values())
-
-
-def rule_features(text: str, cfg: Dict) -> Dict[str, int]:
-    feats = {k: 0 for k in ["url","contact","currency","discount","cta","keyword","repeat","caps","emoji"]}
-    t = text
-    if cfg["check_urls"] and URL_RE.search(t): feats["url"] += 1
-    if cfg["check_contacts"] and (PHONE_RE.search(t) or EMAIL_RE.search(t) or SOCIAL_RE.search(t)): feats["contact"] += 1
-    if cfg["check_prices"] and CURRENCY_RE.search(t): feats["currency"] += 1
-    if cfg["check_discounts"] and DISCOUNT_RE.search(t): feats["discount"] += 1
-    if cfg["check_cta"] and CTA_RE.search(t): feats["cta"] += 1
-    if cfg["check_keywords"] and KEYWORDS_RE.search(t): feats["keyword"] += 1
-    if cfg["check_repetition"] and repeated_token_count(t) >= cfg["min_repeated_word"]: feats["repeat"] += 1
-    if cfg["check_caps_ratio"] and upper_ratio(t.split()) >= cfg["min_caps_ratio"]: feats["caps"] += 1
-    if cfg["check_emoji_row"] and len(EMOJI_RE.findall(t)) >= cfg["min_emojis"]: feats["emoji"] += 1
-    return feats
-
-
+# ============== RULE LABEL (minimal) ==============
 def rule_label(text: str) -> Tuple[str, str]:
-    feats = rule_features(text, CONFIG["ad_rules"])
-    hits = sum(1 for v in feats.values() if v > 0)
+    """
+    Minimal rules:
+      - Only obvious Ads (URL, phone, socials).
+      - Only obvious Spam (multi-links, nonsense mashes).
+      - Only obvious Rants (clear rant phrases).
+      - Everything else -> undecided (transformer decides).
+    """
+    if not text or not text.strip():
+        return "", "empty"
 
-    # Ad detection (same as before)
-    strong_ad = (feats["url"] or feats["contact"] or feats["discount"] or feats["cta"])
-    if strong_ad and hits >= 2:
-        return "Ad", "rule_strong"
-    if CONFIG["ad_rules"]["lenient"]:
-        if (feats["keyword"] and (feats["repeat"] or feats["caps"])) or (hits >= 2 and (feats["keyword"] or feats["currency"])):
-            return "Ad", "rule_weak"
-
-    # Rant detection
+    if URL_RE.search(text) or EMAIL_RE.search(text) or PHONE_RE.search(text) or SOCIAL_RE.search(text):
+        return "Ad", "rule_obvious_ad"
+    if MULTI_URL_RE.search(text) or KEYBOARD_MASH_RE.search(text):
+        return "Spam", "rule_obvious_spam"
     if RANT_RE.search(text):
-        return "Rant", "rule_strong"
+        return "Rant", "rule_obvious_rant"
 
-    # Spam detection
-    if SPAM_RE.search(text):
-        return "Spam", "rule_strong"
+    return "", "undecided"
 
-    # Good (no signals)
-    if hits == 0:
-        return "Good", "rule_strong"
-
-    # Otherwise undecided
-    return "", ""
-
-
-
-# ----------------- PSEUDO-LABELER -----------------
-
+# ============== PSEUDO-LABELER ==============
 def have_teacher_model() -> bool:
     d = CONFIG["teacher_model_dir"]
     return os.path.isdir(d) and os.path.isfile(os.path.join(d, "config.json"))
@@ -176,79 +88,45 @@ def device_name() -> str:
         return "cuda"
     return "cpu"
 
-def pseudo_label_with_teacher(texts: List[str]) -> Tuple[List[str], List[float], List[float]]:
-    """
-    Use your fine-tuned classifier as teacher.
-    Returns: labels, top_probs, margins
-    """
+def pseudo_label_with_teacher(texts: List[str]):
     model_dir = CONFIG["teacher_model_dir"]
     tok = AutoTokenizer.from_pretrained(model_dir)
     mdl = AutoModelForSequenceClassification.from_pretrained(model_dir)
-    dev = device_name()
-    mdl.to(dev)
-    mdl.eval()
+    dev = device_name(); mdl.to(dev); mdl.eval()
 
     all_labels, all_top, all_margin = [], [], []
     bs = 32
     id2label = mdl.config.id2label
+    import numpy as np
     with torch.no_grad():
         for i in range(0, len(texts), bs):
             batch = texts[i:i+bs]
             enc = tok(batch, truncation=True, padding=True,
-                      max_length=CONFIG["teacher_max_length"], return_tensors="pt")
-            enc = {k: v.to(dev) for k, v in enc.items()}
+                      max_length=CONFIG["teacher_max_length"], return_tensors="pt").to(dev)
             logits = mdl(**enc).logits
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             preds = probs.argmax(axis=1)
             top = probs.max(axis=1)
-            # margin = top - second best
-            sorted_probs = -np.sort(-probs, axis=1)
-            margin = sorted_probs[:,0] - sorted_probs[:,1]
-            # map ids to string labels
-            out_labels = [id2label[int(p)] for p in preds]
-            all_labels.extend(out_labels)
-            all_top.extend(top.tolist())
-            all_margin.extend(margin.tolist())
+            margin = np.sort(probs, axis=1)[:,-1] - np.sort(probs, axis=1)[:,-2]
+            all_labels.extend([id2label[int(p)] for p in preds])
+            all_top.extend(top.tolist()); all_margin.extend(margin.tolist())
     return all_labels, all_top, all_margin
 
-def pseudo_label_with_zsl(texts: List[str]) -> Tuple[List[str], List[float], List[float]]:
-    """
-    Zero-shot fallback (CPU ok). Uses BART MNLI to choose between 'Ad' and 'Good'.
-    """
-    clf = pipeline("zero-shot-classification",
-                   model=CONFIG["zsl_model"],
-                   device=-1,             # CPU is safest across environments
-                   truncation=True)
-    labels = CONFIG["labels"]  # ["Ad", "Good", "Rant", "Spam"]
+def pseudo_label_with_zsl(texts: List[str]):
+    clf = pipeline("zero-shot-classification", model=CONFIG["zsl_model"], device=-1)
+    labels = CONFIG["labels"]
     preds, tops, margins = [], [], []
-    bs = CONFIG["zsl_batch_size"]
-    for i in range(0, len(texts), bs):
-        batch = texts[i:i+bs]
+    for i in range(0, len(texts), CONFIG["zsl_batch_size"]):
+        batch = texts[i:i+CONFIG["zsl_batch_size"]]
         res = clf(batch, candidate_labels=labels, multi_label=False)
-        # pipeline returns dict or list of dicts
-        if isinstance(res, dict):
-            res = [res]
+        if isinstance(res, dict): res = [res]
         for r in res:
-            seq_labels = r["labels"]
-            seq_scores = r["scores"]
-            # top & second
-            top_label = seq_labels[0]
-            top_prob = float(seq_scores[0])
-            second_prob = float(seq_scores[1]) if len(seq_scores) > 1 else 0.0
-            preds.append(top_label)
-            tops.append(top_prob)
-            margins.append(top_prob - second_prob)
+            preds.append(r["labels"][0])
+            tops.append(float(r["scores"][0]))
+            margins.append(float(r["scores"][0] - r["scores"][1]))
     return preds, tops, margins
 
-
 def apply_pseudo_labeling(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Runs rule labeling.
-    - Pseudo-labels undecided rows with teacher or zero-shot.
-    - Accepts only high-confidence pseudo labels.
-    - If pseudo_label_train_only=True, pseudo-labeled rows go to TRAIN only (later step).
-    """
-    # 1) Rule labeling
     df = df.copy()
     labels, sources = [], []
     for t in df["text"].tolist():
@@ -258,17 +136,17 @@ def apply_pseudo_labeling(df: pd.DataFrame) -> pd.DataFrame:
     df["label"] = labels
     df["label_source"] = sources
 
-    # 2) Collect undecided rows
+    # Collect undecided + harvest rows
     undecided_mask = (df["label"] == "")
     undecided = df[undecided_mask]
-    print(f"Undecided after rules: {len(undecided)}")
+    print(f"Undecided (incl harvest) after rules: {len(undecided)}")
 
     if len(undecided) == 0:
         return df[df["label"] != ""].reset_index(drop=True)
 
     undecided_texts = undecided["text"].tolist()
 
-    # 3) Pseudo-labeler
+    # Pseudo-labeler
     use_teacher = have_teacher_model()
     print("Pseudo-labeler:", "teacher checkpoint" if use_teacher else "zero-shot (BART MNLI)")
     if use_teacher:
@@ -276,73 +154,71 @@ def apply_pseudo_labeling(df: pd.DataFrame) -> pd.DataFrame:
     else:
         pl_labels, pl_top, pl_margin = pseudo_label_with_zsl(undecided_texts)
 
-    # 4) Confidence filter
-    AD = "Ad"
-    THR_ALL = CONFIG["pseudo_threshold_overall"]
-    THR_AD  = CONFIG["pseudo_threshold_ad"]
-    THR_GAP = CONFIG["min_margin"]
+    RANT, SPAM, AD = "Rant", "Spam", "Ad"
+    THR_ALL = CONFIG["pseudo_threshold_overall"]     # e.g. 0.95
+    THR_AD  = CONFIG["pseudo_threshold_ad"]          # e.g. 0.60
+    THR_GAP = CONFIG["min_margin"]                   # e.g. 0.15
 
-    accept = []
-    for lab, p, m in zip(pl_labels, pl_top, pl_margin):
-        if lab == AD:
+    accept_list = []
+    for idx, (lab, p, m) in enumerate(zip(pl_labels, pl_top, pl_margin)):
+        src = undecided.iloc[idx]["label_source"]
+
+        # Harvest candidates get looser thresholds
+        if "harvest_ad" in src and lab == AD:
+            ok = (p >= 0.50) and (m >= 0.10)
+        elif "harvest_spam" in src and lab == SPAM:
+            ok = (p >= 0.50) and (m >= 0.10)
+        elif lab == AD:
             ok = (p >= THR_AD) and (m >= THR_GAP)
+        elif lab in (RANT, SPAM):
+            ok = (p >= 0.80) and (m >= 0.15)
         else:
             ok = (p >= THR_ALL) and (m >= THR_GAP)
-        accept.append(ok)
 
-    accepted_idx = undecided.index[accept]
-    print(f"Pseudo-labeled accepted: {accept.count(True)} / {len(accept)}")
+        accept_list.append(ok)
 
-    # 5) Apply accepted pseudo labels
-    df.loc[accepted_idx, "label"] = [pl_labels[i] for i, ok in enumerate(accept) if ok]
+    accept = pd.Series(accept_list, index=undecided.index, dtype=bool)
+    accepted_idx = accept[accept].index
+    print(f"Pseudo-labeled accepted: {int(accept.sum())} / {len(accept)}")
+
+    if len(accepted_idx) == 0:
+        return df[df["label"] != ""].reset_index(drop=True)
+
+    pl_series = pd.Series(pl_labels, index=undecided.index)
+    df.loc[accepted_idx, "label"] = pl_series.loc[accepted_idx].values
     df.loc[accepted_idx, "label_source"] = "pseudo_highconf"
 
-    # Drop any rows still unlabeled
     df = df[df["label"] != ""].reset_index(drop=True)
     return df
 
 
-# -------------- Rebalance helper --------------
-
+# ============== REBALANCE ==============
 def rebalance_train(df_train: pd.DataFrame) -> pd.DataFrame:
     counts = df_train["label"].value_counts()
-    target = counts.max()  # bring all classes up to majority
-    rng = random.Random(CONFIG["random_seed"])
+    target = counts.max()
     parts = []
     for lbl in CONFIG["labels"]:
         part = df_train[df_train["label"] == lbl]
-        if len(part) == 0:
-            continue
-        extra = part.sample(n=target - len(part), replace=True, random_state=CONFIG["random_seed"])
-        parts.append(pd.concat([part, extra], ignore_index=True))
-    out = pd.concat(parts, ignore_index=True).sample(frac=1.0, random_state=CONFIG["random_seed"])
-    return out
+        if not part.empty:
+            extra = part.sample(n=target - len(part), replace=True, random_state=CONFIG["random_seed"])
+            parts.append(pd.concat([part, extra], ignore_index=True))
+    return pd.concat(parts, ignore_index=True).sample(frac=1.0, random_state=CONFIG["random_seed"])
 
-
-
-# -------------- Main pipeline --------------
-
+# ============== MAIN ==============
 def main():
     random.seed(CONFIG["random_seed"])
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
-    # 1) Load CSVs
+    # 1) Load & merge CSVs
     df1 = pd.read_csv("reviews.csv")
     df2 = pd.read_csv("reviews2.csv")
 
-    # Make sure df2 has the same columns as df1
-    need = ["business_name", "author_name", "text", "photo", "rating", "rating_category"]
+    need = ["business_name","author_name","text","photo","rating","rating_category"]
     for c in need:
         if c not in df2.columns:
-            df2[c] = ""   # add missing columns if any
+            df2[c] = ""
 
-    # Concatenate
     df = pd.concat([df1, df2], ignore_index=True)
-
-    # Sanity check
-    miss = [c for c in need if c not in df.columns]
-    if miss:
-        raise ValueError(f"Missing expected columns: {miss}")
 
     # 2) Clean
     df["text"] = df["text"].astype(str).map(basic_clean)
@@ -353,53 +229,134 @@ def main():
     # 3) Rules + Pseudo labeling
     df_labeled = apply_pseudo_labeling(df)
 
-
-
-
-    # 4) Map labels to ids
+    # 4) Map labels → ids
     label2id = {lbl: i for i, lbl in enumerate(CONFIG["labels"])}
     id2label = {i: lbl for lbl, i in label2id.items()}
     df_labeled["label_id"] = df_labeled["label"].map(label2id)
 
+    # --- helper: can we stratify? (every class needs ≥2 samples) ---
+    from collections import Counter
+    def can_stratify_frame(frame: pd.DataFrame) -> bool:
+        if len(frame) == 0:
+            return False
+        cnt = Counter(frame["label_id"])
+        return (len(cnt) >= 2) and all(v >= 2 for v in cnt.values())
+
     # 5) Split
-    # Option A (safer): keep pseudo-labeled rows only in TRAIN
     if CONFIG["pseudo_label_train_only"]:
         train_part = df_labeled[df_labeled["label_source"] == "pseudo_highconf"]
         base_part  = df_labeled[df_labeled["label_source"] != "pseudo_highconf"]
 
-        # split base_part into train/val/test (stratified)
-        tr_base, tmp = train_test_split(
-            base_part[["text","label","label_id","label_source"]],
-            test_size=CONFIG["val_size"] + CONFIG["test_size"],
-            random_state=CONFIG["random_seed"],
-            stratify=base_part["label_id"],
-        )
-        rel_test = CONFIG["test_size"] / (CONFIG["val_size"] + CONFIG["test_size"])
-        val_base, test_base = train_test_split(
-            tmp, test_size=rel_test,
-            random_state=CONFIG["random_seed"],
-            stratify=tmp["label_id"],
-        )
-        # add pseudo-labeled rows to train only
-        df_train = pd.concat([tr_base, train_part[["text","label","label_id","label_source"]]],
-                             ignore_index=True).sample(frac=1.0, random_state=CONFIG["random_seed"])
-        df_val = val_base.reset_index(drop=True)
+        print("Base counts before splitting:", base_part["label"].value_counts().to_dict())
+
+        test_frac = CONFIG["test_size"]
+        val_frac  = CONFIG["val_size"]
+        total_test_val = test_frac + val_frac
+        rel_test = test_frac / total_test_val if total_test_val > 0 else 0.5
+
+        if len(base_part) == 0:
+            # Edge case: no human/rule-labeled base — take val/test from full labeled (non-stratified)
+            print("⚠️ No base_part rows; using non-stratified split from all labeled rows for val/test.")
+            tr_base, tmp = train_test_split(
+                df_labeled[["text","label","label_id","label_source"]],
+                test_size=total_test_val,
+                random_state=CONFIG["random_seed"],
+                stratify=None,
+            )
+            val_base, test_base = train_test_split(
+                tmp, test_size=rel_test,
+                random_state=CONFIG["random_seed"],
+                stratify=None,
+            )
+        else:
+            if can_stratify_frame(base_part):
+                tr_base, tmp = train_test_split(
+                    base_part[["text","label","label_id","label_source"]],
+                    test_size=total_test_val,
+                    random_state=CONFIG["random_seed"],
+                    stratify=base_part["label_id"],
+                )
+                if can_stratify_frame(tmp):
+                    val_base, test_base = train_test_split(
+                        tmp, test_size=rel_test,
+                        random_state=CONFIG["random_seed"],
+                        stratify=tmp["label_id"],
+                    )
+                else:
+                    print("⚠️ Fallback: tmp too imbalanced for stratify → non-stratified val/test.")
+                    val_base, test_base = train_test_split(
+                        tmp, test_size=rel_test,
+                        random_state=CONFIG["random_seed"],
+                        stratify=None,
+                    )
+            else:
+                print("⚠️ Fallback: base_part too imbalanced for stratify → non-stratified splits.")
+                tr_base, tmp = train_test_split(
+                    base_part[["text","label","label_id","label_source"]],
+                    test_size=total_test_val,
+                    random_state=CONFIG["random_seed"],
+                    stratify=None,
+                )
+                val_base, test_base = train_test_split(
+                    tmp, test_size=rel_test,
+                    random_state=CONFIG["random_seed"],
+                    stratify=None,
+                )
+
+        # Add high-confidence pseudo-labeled ONLY to train
+        df_train = pd.concat(
+            [tr_base, train_part[["text","label","label_id","label_source"]]],
+            ignore_index=True
+        ).sample(frac=1.0, random_state=CONFIG["random_seed"])
+        df_val  = val_base.reset_index(drop=True)
         df_test = test_base.reset_index(drop=True)
 
     else:
-        # Option B: stratified split on the full labeled set
-        df_train, df_tmp = train_test_split(
-            df_labeled[["text","label","label_id","label_source"]],
-            test_size=CONFIG["val_size"] + CONFIG["test_size"],
-            random_state=CONFIG["random_seed"],
-            stratify=df_labeled["label_id"],
-        )
-        rel_test = CONFIG["test_size"] / (CONFIG["val_size"] + CONFIG["test_size"])
-        df_val, df_test = train_test_split(
-            df_tmp, test_size=rel_test,
-            random_state=CONFIG["random_seed"],
-            stratify=df_tmp["label_id"],
-        )
+        # Stratify on the full labeled set when possible; else fallback
+        print("Full labeled counts before splitting:", df_labeled["label"].value_counts().to_dict())
+        test_frac = CONFIG["test_size"]
+        val_frac  = CONFIG["val_size"]
+        total_test_val = test_frac + val_frac
+        rel_test = test_frac / total_test_val if total_test_val > 0 else 0.5
+
+        if can_stratify_frame(df_labeled):
+            df_train, tmp = train_test_split(
+                df_labeled[["text","label","label_id","label_source"]],
+                test_size=total_test_val,
+                random_state=CONFIG["random_seed"],
+                stratify=df_labeled["label_id"],
+            )
+            if can_stratify_frame(tmp):
+                df_val, df_test = train_test_split(
+                    tmp, test_size=rel_test,
+                    random_state=CONFIG["random_seed"],
+                    stratify=tmp["label_id"],
+                )
+            else:
+                print("⚠️ Fallback: tmp too imbalanced for stratify → non-stratified val/test.")
+                df_val, df_test = train_test_split(
+                    tmp, test_size=rel_test,
+                    random_state=CONFIG["random_seed"],
+                    stratify=None,
+                )
+        else:
+            print("⚠️ Fallback: df_labeled too imbalanced for stratify → non-stratified splits.")
+            df_train, tmp = train_test_split(
+                df_labeled[["text","label","label_id","label_source"]],
+                test_size=total_test_val,
+                random_state=CONFIG["random_seed"],
+                stratify=None,
+            )
+            df_val, df_test = train_test_split(
+                tmp, test_size=rel_test,
+                random_state=CONFIG["random_seed"],
+                stratify=None,
+            )
+
+        # Keep indices tidy
+        df_train = df_train.reset_index(drop=True)
+        df_val   = df_val.reset_index(drop=True)
+        df_test  = df_test.reset_index(drop=True)
 
     # 6) Rebalance TRAIN (optional)
     print("Label counts BEFORE rebalance:")
@@ -411,28 +368,20 @@ def main():
         df_train = rebalance_train(df_train)
         print("Label counts AFTER rebalance (train):", df_train["label"].value_counts().to_dict())
 
-    # 7) Save processed files
-    paths = {
-        "train": os.path.join(CONFIG["output_dir"], "train.csv"),
-        "val":   os.path.join(CONFIG["output_dir"], "val.csv"),
-        "test":  os.path.join(CONFIG["output_dir"], "test.csv"),
-    }
-    df_train[["text","label","label_id"]].to_csv(paths["train"], index=False)
-    df_val[["text","label","label_id"]].to_csv(paths["val"], index=False)
-    df_test[["text","label","label_id"]].to_csv(paths["test"], index=False)
+    # 7) Save
+    outdir = CONFIG["output_dir"]
+    df_train[["text","label","label_id"]].to_csv(f"{outdir}/train.csv", index=False)
+    df_val[["text","label","label_id"]].to_csv(f"{outdir}/val.csv", index=False)
+    df_test[["text","label","label_id"]].to_csv(f"{outdir}/test.csv", index=False)
 
-    with open(os.path.join(CONFIG["output_dir"], "label2id.json"), "w") as f:
+    with open(f"{outdir}/label2id.json", "w") as f:
         json.dump(label2id, f)
-    with open(os.path.join(CONFIG["output_dir"], "id2label.json"), "w") as f:
+    with open(f"{outdir}/id2label.json", "w") as f:
         json.dump({str(k): v for k, v in id2label.items()}, f)
 
-    print("\nWrote:")
-    for k, p in paths.items():
-        print(f"  {k}: {p} ({len(pd.read_csv(p))} rows)")
-    print("  label maps:", os.path.join(CONFIG["output_dir"], "label2id.json"),
-          os.path.join(CONFIG["output_dir"], "id2label.json"))
+    print("\nWrote train/val/test + label maps.")
 
-if __name__ == "__main__":
-    # small numpy import needed by teacher margin calc
-    import numpy as np  # noqa: F401
+if __name__=="__main__": 
     main()
+
+

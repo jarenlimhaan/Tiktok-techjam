@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # train_hf.py — fine-tune DistilBERT (multi-class OK) on Google reviews
 # Requires: pip install "transformers>=4.44" "datasets>=3.0.0" evaluate scikit-learn
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
 from typing import Dict
@@ -10,7 +12,9 @@ import evaluate
 import transformers
 import datasets as hf_datasets  # for version print
 
-from datasets import load_dataset, concatenate_datasets, interleave_datasets
+
+    
+from datasets import load_dataset, concatenate_datasets
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -25,8 +29,11 @@ from transformers import (
     TrainingArguments,
     Trainer,
     EarlyStoppingCallback,
+    DataCollatorWithPadding,
     set_seed,
 )
+
+
 
 print("TFX:", transformers.__version__, "| Datasets:", hf_datasets.__version__, "| Evaluate:", evaluate.__version__)
 
@@ -43,18 +50,15 @@ CONFIG = {
     "model_name": "distilbert-base-uncased",
     "max_length": 128,
     "batch_size": 16,
-    "num_epochs": 4,
+    "num_epochs": 6,
     "learning_rate": 2e-5,
     "weight_decay": 0.01,
     "warmup_ratio": 0.06,
     "seed": 42,
 
-    "output_dir": "checkpoints/distilbert_policy",
+    "output_dir": "checkpoints/distilbert_uncased",
     "early_stopping_patience": 2,
     "metric_for_best_model": "f1_macro",
-
-    # Optional: set a float (e.g., 10.0) to force heavier weight for the minority class in binary,
-    # otherwise inverse-frequency weights are used for any number of classes.
     "manual_minority_weight": None,
 }
 # ==================================================
@@ -78,11 +82,11 @@ def main():
 
     # ---------- Tokenizer ----------
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_name"])
+    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)  # good for CUDA tensor cores
 
     def tokenize(batch):
         return tokenizer(
             batch["text"],
-            padding="max_length",
             truncation=True,
             max_length=cfg["max_length"],
         )
@@ -103,37 +107,11 @@ def main():
         y = np.array(ds[split]["labels"])
         print("Label counts", split, ":", collections.Counter(y))
 
-    # ---------- Oversample TRAIN to balance ALL classes ----------
-    # Bring every class up to the size of the largest one.
-    train = ds["train"]
-    y = np.array(train["labels"])
+ 
+    y = np.array(ds["train"]["labels"])
     counts = np.bincount(y, minlength=num_labels)
-    target = counts.max()  # target size per class
-    parts = []
-    rng = np.random.default_rng(42)
-
-    for cls_id in range(num_labels):
-        idx = np.where(y == cls_id)[0]
-        if len(idx) == 0:
-            continue
-        base_ds = train.select(idx)
-        need = int(target - len(idx))
-        if need > 0:
-            # sample WITH replacement inside this class
-            extra_choices = rng.integers(0, len(idx), size=need).tolist()
-            extra_ds = base_ds.select(extra_choices)
-            parts.append(concatenate_datasets([base_ds, extra_ds]))
-        else:
-            parts.append(base_ds)
-
-    if len(parts) > 0:
-        balanced_train = interleave_datasets(parts, seed=42).shuffle(seed=42)
-        ds["train"] = balanced_train
-
-        y2 = np.array(ds["train"]["labels"])
-        print("Label counts train (after multi-class oversample):", collections.Counter(y2))
-    else:
-        print("No oversampling applied (no parts built).")
+    print("Train label counts:", collections.Counter(y))
+    
 
     # ---------- Keep only model-needed columns ----------
     keep_cols = ["input_ids", "attention_mask", "labels"]
@@ -205,6 +183,12 @@ def main():
             return (loss, outputs) if return_outputs else loss
 
     # ---------- Training arguments ----------
+    from torch import cuda, backends
+    device_is_cuda = torch.cuda.is_available()
+    if device_is_cuda:
+        backends.cuda.matmul.allow_tf32 = True
+        backends.cudnn.allow_tf32 = True
+
     args = TrainingArguments(
         output_dir=cfg["output_dir"],
         per_device_train_batch_size=cfg["batch_size"],
@@ -213,17 +197,26 @@ def main():
         learning_rate=cfg["learning_rate"],
         weight_decay=cfg["weight_decay"],
         warmup_ratio=cfg["warmup_ratio"],
-
-        eval_strategy="epoch",            # new API
+        optim=("adamw_torch_fused" if device_is_cuda else "adamw_torch"),
+        eval_strategy="epoch",       # <-- correct key
         save_strategy="epoch",
+        save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model=cfg["metric_for_best_model"],
         greater_is_better=True,
 
-        logging_strategy="epoch",
-        report_to=[],                     # disable WandB/TensorBoard
+        # Throughput
+        dataloader_num_workers=4,          # try 4–8
+        dataloader_pin_memory=device_is_cuda,  # True on CUDA, False on MPS/CPU
+
+        # CUDA-only boosts:
+        fp16=device_is_cuda,               # or bf16=True on Ampere+
+        tf32=True if device_is_cuda else False,
+        torch_compile=True if device_is_cuda else False,  # disable on MPS/CPU
+
+        logging_steps=50,
+        report_to=[],
         seed=cfg["seed"],
-        dataloader_pin_memory=False,      # quiet MPS
     )
 
     callbacks = [EarlyStoppingCallback(early_stopping_patience=cfg["early_stopping_patience"])]
@@ -236,6 +229,7 @@ def main():
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
+        data_collator=data_collator
     )
 
     # ---------- Train ----------
@@ -247,6 +241,52 @@ def main():
     print(">>> Saving best model & tokenizer…")
     trainer.save_model(cfg["output_dir"])
     tokenizer.save_pretrained(cfg["output_dir"])
+
+    # ---------- Hard-negative mining (one quick round) ----------
+    # 1) Get validation predictions and find mistakes
+    val_logits, val_labels, _ = trainer.predict(ds["validation"])
+    val_preds = val_logits.argmax(axis=1)
+    mist_idx = np.where(val_preds != val_labels)[0]
+    print(f"\n[HNM] Hard negatives (val mistakes): {len(mist_idx)}")
+
+    if len(mist_idx) > 0:
+        # 2) Add misclassified validation rows back into TRAIN (with gold labels)
+        hard_val = ds["validation"].select(mist_idx)
+        ds["train"] = concatenate_datasets([ds["train"], hard_val]).shuffle(seed=42)
+
+        # 3) Recompute class weights (no oversampling; rely on weights only)
+        y_train = np.array(ds["train"]["labels"])
+        counts = np.bincount(y_train, minlength=num_labels)
+        device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+
+        if cfg.get("manual_minority_weight") is not None and num_labels == 2:
+            minority = int(counts.argmin())
+            weights = torch.tensor(
+                [cfg["manual_minority_weight"] if i == minority else 1.0 for i in range(num_labels)],
+                dtype=torch.float, device=device
+            )
+        else:
+            # inverse-frequency weights for any number of classes
+            weights = counts.sum() / np.maximum(counts, 1)
+            weights = torch.tensor(weights, dtype=torch.float, device=device)
+            # optional: normalize to mean 1 (cosmetic)
+            weights = weights / weights.mean()
+
+        # 4) OPTIONAL: shorter second round with lower LR
+        trainer.args.num_train_epochs = 2
+        trainer.args.learning_rate = float(cfg["learning_rate"]) * 0.5
+
+        print("\n[HNM] Retraining briefly on augmented train (weights only, no oversampling)…")
+        trainer.train(resume_from_checkpoint=True)
+
+        # 5) Save again (overwrites best model with improved one)
+        print("[HNM] Saving improved model…")
+        trainer.save_model(cfg["output_dir"])
+        tokenizer.save_pretrained(cfg["output_dir"])
+    else:
+        print("[HNM] No hard negatives found; skipping extra round.")
+
+
 
     # ---------- Threshold tuning (binary only) ----------
     if num_labels == 2:
